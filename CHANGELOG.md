@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.0.4
+
+- Fixed Claude Desktop/Cowork usage getting stuck at 0% used (100% remaining)
+  after the separate local Claude Code access token expired.
+- Refreshes the Claude Code OAuth session through the same Anthropic token
+  endpoint and client identity used by the official Claude Code client.
+- Keeps the refreshed token only in Claude's official credential store and
+  never copies it into application settings or logs.
+- Uses the official status-line rate-limit payload for terminal Claude Code
+  sessions and a two-minute account poll for Claude Desktop sessions.
+
 ## 3.0.3
 
 - Fixed a crash dialog when reading a cached Claude reading whose fields were

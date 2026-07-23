@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace ClaudeCodexLimits;
 
@@ -13,6 +14,11 @@ internal sealed class ClaudeAuthException(string message) : InvalidOperationExce
 
 internal sealed class UsageService
 {
+    private const string ClaudeOAuthTokenUrl =
+        "https://platform.claude.com/v1/oauth/token";
+    private const string ClaudeCodeClientId =
+        "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
     private static readonly HttpClient ClaudeHttpClient = new()
     {
         Timeout = TimeSpan.FromSeconds(12)
@@ -23,18 +29,12 @@ internal sealed class UsageService
         PropertyNameCaseInsensitive = true
     };
 
-    // The Anthropic usage endpoint rate-limits aggressively: measured, it
-    // accepts roughly one request every 90 seconds, and a short burst locks it
-    // out for minutes. Live calls are therefore throttled and served from the
-    // last good response in between. The interval tightens as the quota fills,
-    // because that is when an accurate number actually matters.
-    // 120s rather than the measured ~90s floor: the margin absorbs drift and a
-    // competing caller, and the bridge already covers Claude Code usage the
-    // instant it happens, so the fast band only has to catch other surfaces.
-    private static readonly TimeSpan FastInterval = TimeSpan.FromSeconds(120);
-    private static readonly TimeSpan MediumInterval = TimeSpan.FromMinutes(2.5);
-    private static readonly TimeSpan LiveInterval = TimeSpan.FromMinutes(5);
-    private static readonly TimeSpan ForcedLiveInterval = TimeSpan.FromSeconds(45);
+    // The Anthropic usage endpoint rate-limits aggressively. Two minutes keeps
+    // Claude Desktop/Cowork readings reasonably fresh while leaving margin
+    // above the observed rate-limit floor. Terminal Claude Code sessions still
+    // arrive immediately through the status-line bridge.
+    private static readonly TimeSpan AccountPollInterval = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan ForcedLiveInterval = TimeSpan.FromSeconds(95);
 
     // Claude Code writes its own rate-limit payload through the status-line
     // bridge every time it renders, which is exactly when usage moves. A recent
@@ -52,6 +52,12 @@ internal sealed class UsageService
     private DateTimeOffset _lastLiveAttempt = DateTimeOffset.MinValue;
     private TimeSpan _liveBackoff = TimeSpan.Zero;
     private bool _seeded;
+
+    private sealed record ClaudeSession(
+        string AccessToken,
+        string? RefreshToken,
+        DateTimeOffset? ExpiresAt,
+        string CredentialPath);
 
     public string AppDataDirectory => _appDataDirectory;
 
@@ -93,7 +99,8 @@ internal sealed class UsageService
             {
                 _seeded = true;
                 var seed = await ReadClaudeCacheFileAsync(_liveCachePath, cancellationToken);
-                if (seed?.UpdatedAt is { } seededAt && DateTimeOffset.Now - seededAt < LiveInterval)
+                if (seed?.UpdatedAt is { } seededAt &&
+                    DateTimeOffset.Now - seededAt < AccountPollInterval)
                 {
                     _lastLiveClaude = seed with
                     {
@@ -113,7 +120,7 @@ internal sealed class UsageService
             // cannot stampede into a longer lockout.
             var interval = forceLive || rolledOver
                 ? ForcedLiveInterval + _liveBackoff
-                : CurrentInterval() + _liveBackoff;
+                : AccountPollInterval + _liveBackoff;
 
             if (DateTimeOffset.Now - _lastLiveAttempt < interval)
             {
@@ -166,26 +173,6 @@ internal sealed class UsageService
         {
             _claudeGate.Release();
         }
-    }
-
-    /// <summary>
-    /// Polls harder the closer the quota is to running out, so a limit that is
-    /// about to bite is tracked near the endpoint's floor while an idle account
-    /// costs almost nothing.
-    /// </summary>
-    private TimeSpan CurrentInterval()
-    {
-        var highest = _lastLiveClaude is { Windows.Count: > 0 }
-            ? _lastLiveClaude.Windows.Max(window => window.UsedPercent)
-            : (double?)null;
-
-        return highest switch
-        {
-            null => LiveInterval,
-            >= 80 => FastInterval,
-            >= 50 => MediumInterval,
-            _ => LiveInterval
-        };
     }
 
     private static TimeSpan NextBackoff(Exception failure, TimeSpan current) => failure switch
@@ -333,8 +320,33 @@ internal sealed class UsageService
                 "No Claude session was found. Sign in to Claude Code once; the terminal does not need to remain open.");
         }
 
+        var session = await ReadClaudeSessionAsync(credentialPath, cancellationToken);
+        if (session.ExpiresAt is { } expiry &&
+            expiry <= DateTimeOffset.Now.AddSeconds(30))
+        {
+            session = await RefreshClaudeSessionAsync(session, cancellationToken);
+        }
+
+        try
+        {
+            return await RequestClaudeUsageAsync(session.AccessToken, cancellationToken);
+        }
+        catch (HttpRequestException ex) when (
+            ex.StatusCode == HttpStatusCode.Unauthorized &&
+            !string.IsNullOrWhiteSpace(session.RefreshToken))
+        {
+            session = await RefreshClaudeSessionAsync(session, cancellationToken);
+            return await RequestClaudeUsageAsync(session.AccessToken, cancellationToken);
+        }
+    }
+
+    private static async Task<ClaudeSession> ReadClaudeSessionAsync(
+        string credentialPath,
+        CancellationToken cancellationToken)
+    {
         string? accessToken;
-        DateTimeOffset? expiresAt = null;
+        string? refreshToken;
+        DateTimeOffset? expiresAt;
         await using (var stream = new FileStream(
             credentialPath,
             FileMode.Open,
@@ -360,6 +372,11 @@ internal sealed class UsageService
                 : oauth.TryGetProperty("access_token", out tokenElement)
                     ? tokenElement.GetString()
                     : null;
+            refreshToken = oauth.TryGetProperty("refreshToken", out var refreshElement)
+                ? refreshElement.GetString()
+                : oauth.TryGetProperty("refresh_token", out refreshElement)
+                    ? refreshElement.GetString()
+                    : null;
             expiresAt = ReadExpiry(oauth);
         }
 
@@ -369,20 +386,141 @@ internal sealed class UsageService
                 "The Claude OAuth session is empty. Sign in to Claude Code once.");
         }
 
-        if (expiresAt is { } expiry && expiry <= DateTimeOffset.Now.AddSeconds(30))
+        return new ClaudeSession(
+            accessToken,
+            refreshToken,
+            expiresAt,
+            credentialPath);
+    }
+
+    private static async Task<ClaudeSession> RefreshClaudeSessionAsync(
+        ClaudeSession session,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(session.RefreshToken))
         {
-            // Claude Code renews this token itself; calling now would only burn
-            // a request and come back HTTP 401.
             throw new ClaudeAuthException(
-                $"The Claude session expired at {expiry.ToLocalTime():HH:mm}. Open Claude Code once to renew it.");
+                "The Claude session expired and has no refresh token. Sign in to Claude Code once.");
         }
 
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            ClaudeOAuthTokenUrl);
+        request.Headers.TryAddWithoutValidation("anthropic-beta", "oauth-2025-04-20");
+        request.Headers.UserAgent.ParseAdd("WindowsAIStatusbar/3.0.4");
+        request.Content = new StringContent(
+            JsonSerializer.Serialize(new
+            {
+                grant_type = "refresh_token",
+                refresh_token = session.RefreshToken,
+                client_id = ClaudeCodeClientId
+            }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+
+        using var response = await ClaudeHttpClient.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new ClaudeAuthException(
+                $"Claude session refresh returned HTTP {(int)response.StatusCode}.");
+        }
+
+        await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var document = await JsonDocument.ParseAsync(
+            responseStream,
+            cancellationToken: cancellationToken);
+        var root = document.RootElement;
+        var accessToken = root.TryGetProperty("access_token", out var accessElement)
+            ? accessElement.GetString()
+            : null;
+        var refreshToken = root.TryGetProperty("refresh_token", out var refreshElement)
+            ? refreshElement.GetString()
+            : session.RefreshToken;
+        var expiresIn = root.TryGetProperty("expires_in", out var expiryElement) &&
+                        expiryElement.ValueKind == JsonValueKind.Number &&
+                        expiryElement.TryGetInt64(out var seconds)
+            ? seconds
+            : 0L;
+
+        if (string.IsNullOrWhiteSpace(accessToken) || expiresIn <= 0)
+        {
+            throw new ClaudeAuthException(
+                "Claude session refresh returned an incomplete response.");
+        }
+
+        var expiresAt = DateTimeOffset.UtcNow.AddSeconds(expiresIn);
+        var refreshed = new ClaudeSession(
+            accessToken,
+            refreshToken,
+            expiresAt,
+            session.CredentialPath);
+        await PersistClaudeSessionAsync(refreshed, cancellationToken);
+        return refreshed;
+    }
+
+    private static async Task PersistClaudeSessionAsync(
+        ClaudeSession session,
+        CancellationToken cancellationToken)
+    {
+        JsonNode? root;
+        await using (var stream = new FileStream(
+            session.CredentialPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite,
+            4096,
+            FileOptions.Asynchronous | FileOptions.SequentialScan))
+        {
+            root = await JsonNode.ParseAsync(stream, cancellationToken: cancellationToken);
+        }
+
+        if (root is not JsonObject rootObject)
+        {
+            throw new ClaudeAuthException("The Claude credential store is not a JSON object.");
+        }
+
+        var oauth = rootObject["claudeAiOauth"] as JsonObject ??
+                    rootObject["oauth"] as JsonObject;
+        if (oauth is null)
+        {
+            throw new ClaudeAuthException("No Claude OAuth session was found.");
+        }
+
+        oauth["accessToken"] = session.AccessToken;
+        oauth["refreshToken"] = session.RefreshToken;
+        oauth["expiresAt"] = session.ExpiresAt?.ToUnixTimeMilliseconds();
+
+        var temporaryPath = session.CredentialPath + $".statusbar-{Environment.ProcessId}.tmp";
+        try
+        {
+            await File.WriteAllTextAsync(
+                temporaryPath,
+                rootObject.ToJsonString(JsonOptions),
+                cancellationToken);
+            File.Replace(temporaryPath, session.CredentialPath, null, ignoreMetadataErrors: true);
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath))
+            {
+                File.Delete(temporaryPath);
+            }
+        }
+    }
+
+    private static async Task<ProviderUsage> RequestClaudeUsageAsync(
+        string accessToken,
+        CancellationToken cancellationToken)
+    {
         using var request = new HttpRequestMessage(
             HttpMethod.Get,
             "https://api.anthropic.com/api/oauth/usage");
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
         request.Headers.TryAddWithoutValidation("anthropic-beta", "oauth-2025-04-20");
-        request.Headers.UserAgent.ParseAdd("WindowsAIStatusbar/3.0.1");
+        request.Headers.UserAgent.ParseAdd("WindowsAIStatusbar/3.0.4");
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
         using var response = await ClaudeHttpClient.SendAsync(

@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>WindowsAIStatusbar</AssemblyName>
     <RootNamespace>ClaudeCodexLimits</RootNamespace>
-    <Version>3.0.3</Version>
+    <Version>3.0.4</Version>
     <Authors>Windows AI Statusbar contributors</Authors>
     <Description>Compact Windows taskbar monitor for Claude and Codex usage limits.</Description>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>

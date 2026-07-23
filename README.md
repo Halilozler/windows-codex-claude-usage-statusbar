@@ -88,12 +88,10 @@ The published executable is `publish\WindowsAIStatusbar.exe`.
   taskbar. At least one provider remains enabled so the application stays
   accessible.
 - The panel refreshes every 30 seconds and countdowns update every second.
-- Claude limits come from two sources. While Claude Code is in use, its own
-  rate-limit payload arrives through the status-line bridge within seconds, at
-  no request cost. Usage from anywhere else is caught by a live read of the
-  Anthropic account, which is rate-limited hard by that endpoint (measured: one
-  request per ~90 seconds), so reads are throttled to one every 2 minutes above
-  80 percent quota, 2.5 minutes above 50 percent, and 5 minutes otherwise.
+- Claude limits come from two sources. While terminal Claude Code is in use,
+  its official rate-limit payload arrives through the status-line bridge
+  within seconds, at no request cost. Claude Desktop/Cowork and other surfaces
+  are covered by a live Anthropic account read every two minutes.
 - The **LIVE** / **LOCAL** badge and the note in the details window always show
   which source and which age is on screen.
 - **Refresh** forces an early live read, subject to a short floor that grows if
@@ -102,8 +100,9 @@ The published executable is `publish\WindowsAIStatusbar.exe`.
 ## Security model
 
 - No third-party runtime packages are used.
-- The Claude OAuth token is read from the official local Claude credential
-  store, used only in memory, and sent only to Anthropic's usage endpoint.
+- Claude OAuth tokens are read from Claude's official local credential store
+  and sent only to Anthropic's official token and usage endpoints. Refreshed
+  credentials are written atomically back to Claude's own store.
 - Tokens are never written to application settings or logs.
 - Codex credentials are not read directly; the installed Codex CLI performs
   the local rate-limit request.
