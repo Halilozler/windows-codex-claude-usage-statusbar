@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.0.3
+
+- Fixed a crash dialog when reading a cached Claude reading whose fields were
+  null. The status-line bridge writes `null` for a window it has no data for,
+  and `JsonElement.TryGetInt64` / `TryGetDouble` throw on a null token rather
+  than returning false, so the read escaped as an unhandled exception. Every
+  number is now checked for the Number kind before it is read.
+- Hardened the cache reader to treat any malformed snapshot as an absent
+  source instead of failing.
+- Wrapped the periodic refresh and added process-wide exception handlers, so a
+  single unexpected failure can no longer bring the tray application down.
+
 ## 3.0.2
 
 - Fixed Claude showing stale numbers. The Anthropic usage endpoint accepts

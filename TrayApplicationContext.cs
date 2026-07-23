@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 
@@ -213,6 +214,14 @@ internal sealed class TrayApplicationContext : ApplicationContext
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
             _snapshot = await _usageService.GetSnapshotAsync(timeout.Token, forceLive);
             UpdateUi();
+        }
+        catch (Exception ex)
+        {
+            // This runs from async-void timer and menu handlers, so an escaping
+            // exception becomes an unhandled crash dialog. A single failed
+            // refresh must never take the whole tray app down; skip it and let
+            // the next tick try again.
+            Debug.WriteLine($"Refresh failed: {ex}");
         }
         finally
         {

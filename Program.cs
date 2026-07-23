@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace ClaudeCodexLimits;
 
 internal static class Program
@@ -10,6 +12,15 @@ internal static class Program
         {
             return;
         }
+
+        // A background monitor should degrade quietly, never interrupt the user
+        // with a crash dialog. These handlers keep an unforeseen exception on
+        // any thread from tearing the tray app down.
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, e) =>
+            Debug.WriteLine($"Unhandled UI exception: {e.Exception}");
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            Debug.WriteLine($"Unhandled exception: {e.ExceptionObject}");
 
         ApplicationConfiguration.Initialize();
         var showOnStart = !Environment.GetCommandLineArgs()

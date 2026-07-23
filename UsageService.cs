@@ -495,6 +495,7 @@ internal sealed class UsageService
 
             DateTimeOffset? updatedAt = null;
             if (root.TryGetProperty("updated_at", out var updatedElement) &&
+                updatedElement.ValueKind == JsonValueKind.Number &&
                 updatedElement.TryGetInt64(out var updatedUnix))
             {
                 updatedAt = DateTimeOffset.FromUnixTimeSeconds(updatedUnix);
@@ -502,8 +503,14 @@ internal sealed class UsageService
 
             return new ProviderUsage("Claude", windows, updatedAt);
         }
-        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is
+            IOException or
+            JsonException or
+            InvalidOperationException or
+            UnauthorizedAccessException)
         {
+            // A malformed or partially written cache is never worth crashing
+            // over; the caller simply treats it as one absent source.
             return null;
         }
     }
@@ -555,7 +562,11 @@ internal sealed class UsageService
             return;
         }
 
+        // TryGetDouble / TryGetInt64 throw on a non-Number token rather than
+        // returning false, and the status-line bridge writes null for a window
+        // it has no data for, so every read is guarded by ValueKind first.
         if (!value.TryGetProperty("used_percentage", out var usedElement) ||
+            usedElement.ValueKind != JsonValueKind.Number ||
             !usedElement.TryGetDouble(out var usedPercent))
         {
             return;
@@ -563,6 +574,7 @@ internal sealed class UsageService
 
         DateTimeOffset? resetsAt = null;
         if (value.TryGetProperty("resets_at", out var resetElement) &&
+            resetElement.ValueKind == JsonValueKind.Number &&
             resetElement.TryGetInt64(out var resetUnix))
         {
             resetsAt = DateTimeOffset.FromUnixTimeSeconds(resetUnix);
