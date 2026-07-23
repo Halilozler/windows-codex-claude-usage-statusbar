@@ -1,8 +1,15 @@
 using System.Diagnostics;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
 
 namespace ClaudeCodexLimits;
+
+/// <summary>
+/// The local Claude session is missing, empty, or expired. Retrying quickly
+/// cannot help, so the caller backs off further than for a transient failure.
+/// </summary>
+internal sealed class ClaudeAuthException(string message) : InvalidOperationException(message);
 
 internal sealed class UsageService
 {
@@ -16,8 +23,35 @@ internal sealed class UsageService
         PropertyNameCaseInsensitive = true
     };
 
+    // The Anthropic usage endpoint rate-limits aggressively: measured, it
+    // accepts roughly one request every 90 seconds, and a short burst locks it
+    // out for minutes. Live calls are therefore throttled and served from the
+    // last good response in between. The interval tightens as the quota fills,
+    // because that is when an accurate number actually matters.
+    // 120s rather than the measured ~90s floor: the margin absorbs drift and a
+    // competing caller, and the bridge already covers Claude Code usage the
+    // instant it happens, so the fast band only has to catch other surfaces.
+    private static readonly TimeSpan FastInterval = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan MediumInterval = TimeSpan.FromMinutes(2.5);
+    private static readonly TimeSpan LiveInterval = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan ForcedLiveInterval = TimeSpan.FromSeconds(45);
+
+    // Claude Code writes its own rate-limit payload through the status-line
+    // bridge every time it renders, which is exactly when usage moves. A recent
+    // write is as current as a live read and costs nothing.
+    private static readonly TimeSpan BridgeLiveWindow = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan MaximumBackoff = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan CacheStaleAfter = TimeSpan.FromMinutes(10);
+
     private readonly string _appDataDirectory;
-    private readonly string _claudeCachePath;
+    private readonly string _bridgeCachePath;
+    private readonly string _liveCachePath;
+    private readonly SemaphoreSlim _claudeGate = new(1, 1);
+
+    private ProviderUsage? _lastLiveClaude;
+    private DateTimeOffset _lastLiveAttempt = DateTimeOffset.MinValue;
+    private TimeSpan _liveBackoff = TimeSpan.Zero;
+    private bool _seeded;
 
     public string AppDataDirectory => _appDataDirectory;
 
@@ -27,12 +61,15 @@ internal sealed class UsageService
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "ClaudeCodexLimits");
         Directory.CreateDirectory(_appDataDirectory);
-        _claudeCachePath = Path.Combine(_appDataDirectory, "claude-usage.json");
+        _bridgeCachePath = Path.Combine(_appDataDirectory, "claude-usage.json");
+        _liveCachePath = Path.Combine(_appDataDirectory, "claude-live-cache.json");
     }
 
-    public async Task<UsageSnapshot> GetSnapshotAsync(CancellationToken cancellationToken)
+    public async Task<UsageSnapshot> GetSnapshotAsync(
+        CancellationToken cancellationToken,
+        bool forceLive = false)
     {
-        var claudeTask = ReadClaudeAsync(cancellationToken);
+        var claudeTask = ReadClaudeAsync(forceLive, cancellationToken);
         var codexTask = ReadCodexAsync(cancellationToken);
         await Task.WhenAll(claudeTask, codexTask);
 
@@ -42,38 +79,242 @@ internal sealed class UsageService
             DateTimeOffset.Now);
     }
 
-    private async Task<ProviderUsage> ReadClaudeAsync(CancellationToken cancellationToken)
+    private async Task<ProviderUsage> ReadClaudeAsync(
+        bool forceLive,
+        CancellationToken cancellationToken)
     {
-        string? directError = null;
+        await _claudeGate.WaitAsync(cancellationToken);
         try
         {
-            return await ReadClaudeDirectAsync(cancellationToken);
-        }
-        catch (Exception ex) when (ex is
-            IOException or
-            JsonException or
-            HttpRequestException or
-            InvalidOperationException or
-            UnauthorizedAccessException or
-            TaskCanceledException)
-        {
-            directError = ex.Message;
-        }
+            // A restart should not spend a request when the previous run already
+            // read the account moments ago; that call would only return HTTP 429
+            // and push the process into a needless backoff.
+            if (!_seeded)
+            {
+                _seeded = true;
+                var seed = await ReadClaudeCacheFileAsync(_liveCachePath, cancellationToken);
+                if (seed?.UpdatedAt is { } seededAt && DateTimeOffset.Now - seededAt < LiveInterval)
+                {
+                    _lastLiveClaude = seed with
+                    {
+                        Note = $"Live · Anthropic account · read {seededAt.ToLocalTime():HH:mm}"
+                    };
+                    _lastLiveAttempt = seededAt;
+                }
+            }
 
-        var cached = await ReadClaudeCacheAsync(cancellationToken);
-        if (cached.IsAvailable)
-        {
-            var note = "Live request failed; showing the last safe Claude cache.";
-            return cached with { Name = "Claude", Note = note };
-        }
+            // A window that just rolled over makes the held reading meaningless,
+            // so treat it like a manual refresh rather than waiting out the
+            // full interval.
+            var rolledOver = _lastLiveClaude?.Windows.Any(
+                window => window.ResetsAt is { } at && at <= DateTimeOffset.Now) == true;
 
-        return new ProviderUsage(
-            "Claude",
-            [],
-            null,
-            "Could not retrieve Claude limits",
-            directError ?? "No Claude session was found.");
+            // The backoff applies to manual refreshes too, so repeated clicking
+            // cannot stampede into a longer lockout.
+            var interval = forceLive || rolledOver
+                ? ForcedLiveInterval + _liveBackoff
+                : CurrentInterval() + _liveBackoff;
+
+            if (DateTimeOffset.Now - _lastLiveAttempt < interval)
+            {
+                // Still inside the throttle window: reuse what is already known
+                // instead of spending a request that would come back HTTP 429.
+                // The status-line bridge writes while Claude Code is in use, so
+                // it can be newer than the last live read.
+                var bridge = await ReadClaudeCacheFileAsync(_bridgeCachePath, cancellationToken);
+                if (_lastLiveClaude is not null &&
+                    (bridge?.UpdatedAt ?? DateTimeOffset.MinValue) <= (_lastLiveClaude.UpdatedAt ?? DateTimeOffset.MinValue))
+                {
+                    return _lastLiveClaude;
+                }
+
+                return await ReadClaudeFallbackAsync(
+                    _liveBackoff > TimeSpan.Zero ? "waiting before the next live attempt" : null,
+                    cancellationToken);
+            }
+
+            _lastLiveAttempt = DateTimeOffset.Now;
+
+            string reason;
+            try
+            {
+                var live = await ReadClaudeDirectAsync(cancellationToken);
+                _liveBackoff = TimeSpan.Zero;
+                _lastLiveClaude = live;
+                await WriteClaudeLiveCacheAsync(live, cancellationToken);
+                return live;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is
+                IOException or
+                JsonException or
+                HttpRequestException or
+                InvalidOperationException or
+                UnauthorizedAccessException or
+                OperationCanceledException)
+            {
+                _liveBackoff = NextBackoff(ex, _liveBackoff);
+                reason = DescribeClaudeFailure(ex);
+            }
+
+            return await ReadClaudeFallbackAsync(reason, cancellationToken);
+        }
+        finally
+        {
+            _claudeGate.Release();
+        }
     }
+
+    /// <summary>
+    /// Polls harder the closer the quota is to running out, so a limit that is
+    /// about to bite is tracked near the endpoint's floor while an idle account
+    /// costs almost nothing.
+    /// </summary>
+    private TimeSpan CurrentInterval()
+    {
+        var highest = _lastLiveClaude is { Windows.Count: > 0 }
+            ? _lastLiveClaude.Windows.Max(window => window.UsedPercent)
+            : (double?)null;
+
+        return highest switch
+        {
+            null => LiveInterval,
+            >= 80 => FastInterval,
+            >= 50 => MediumInterval,
+            _ => LiveInterval
+        };
+    }
+
+    private static TimeSpan NextBackoff(Exception failure, TimeSpan current) => failure switch
+    {
+        ClaudeAuthException => TimeSpan.FromMinutes(5),
+        HttpRequestException { StatusCode: HttpStatusCode.TooManyRequests } => TimeSpan.FromSeconds(
+            Math.Min(
+                MaximumBackoff.TotalSeconds,
+                current <= TimeSpan.Zero ? 60d : current.TotalSeconds * 2d)),
+        HttpRequestException http when (int?)http.StatusCode >= 500 => TimeSpan.FromMinutes(1),
+        _ => TimeSpan.FromSeconds(30)
+    };
+
+    private static string DescribeClaudeFailure(Exception failure) => failure switch
+    {
+        HttpRequestException { StatusCode: HttpStatusCode.TooManyRequests } =>
+            "Anthropic is rate-limiting the usage endpoint; retrying shortly.",
+        HttpRequestException { StatusCode: HttpStatusCode.Unauthorized } or
+        HttpRequestException { StatusCode: HttpStatusCode.Forbidden } =>
+            "The Claude session was rejected. Open Claude Code once to renew it.",
+        OperationCanceledException => "The live Claude request timed out.",
+        _ => failure.Message
+    };
+
+    /// <summary>
+    /// Returns the freshest usable Claude reading when the live call is
+    /// unavailable, labelled with its real age so stale numbers are obvious.
+    /// </summary>
+    private async Task<ProviderUsage> ReadClaudeFallbackAsync(
+        string? reason,
+        CancellationToken cancellationToken)
+    {
+        var candidates = new List<(ProviderUsage Usage, string Source, bool FromBridge)>();
+        if (_lastLiveClaude is not null)
+        {
+            candidates.Add((_lastLiveClaude, "Anthropic account", false));
+        }
+
+        var liveCache = await ReadClaudeCacheFileAsync(_liveCachePath, cancellationToken);
+        if (liveCache is not null)
+        {
+            candidates.Add((liveCache, "Anthropic account", false));
+        }
+
+        var bridgeCache = await ReadClaudeCacheFileAsync(_bridgeCachePath, cancellationToken);
+        if (bridgeCache is not null)
+        {
+            candidates.Add((bridgeCache, "Claude Code status line", true));
+        }
+
+        var best = candidates
+            .OrderByDescending(candidate => candidate.Usage.UpdatedAt ?? DateTimeOffset.MinValue)
+            .FirstOrDefault();
+
+        if (best.Usage is null)
+        {
+            return new ProviderUsage(
+                "Claude",
+                [],
+                null,
+                "Could not retrieve Claude limits",
+                reason ?? "No Claude session was found. Sign in to Claude Code once.");
+        }
+
+        // A fresh bridge write is Claude Code's own reading, not a stale copy of
+        // ours, so it earns the live label even when the HTTP call just failed.
+        if (best.FromBridge &&
+            best.Usage.UpdatedAt is { } writtenAt &&
+            DateTimeOffset.Now - writtenAt < BridgeLiveWindow)
+        {
+            return best.Usage with
+            {
+                Name = "Claude",
+                Note = $"Live · Claude Code · read {writtenAt.ToLocalTime():HH:mm}"
+            };
+        }
+
+        return AsCached(best.Usage, best.Source, reason);
+    }
+
+    private static ProviderUsage AsCached(ProviderUsage usage, string source, string? reason)
+    {
+        var now = DateTimeOffset.Now;
+
+        // A window whose reset time has passed has already rolled over, so the
+        // cached percentage no longer describes anything real.
+        var windows = usage.Windows
+            .Where(window => window.ResetsAt is null || window.ResetsAt > now)
+            .ToArray();
+
+        var note = usage.UpdatedAt is { } updatedAt
+            ? $"Cached {updatedAt.ToLocalTime():HH:mm} · {source} · {FormatAge(now - updatedAt)} old"
+            : $"Cached · {source}";
+
+        if (reason is not null)
+        {
+            note = $"{note} · {reason}";
+        }
+
+        if (windows.Length == 0)
+        {
+            return new ProviderUsage(
+                "Claude",
+                [],
+                usage.UpdatedAt,
+                "Cached Claude limits expired",
+                reason ?? "Every cached window has already reset.");
+        }
+
+        if (usage.UpdatedAt is { } stamp && now - stamp > CacheStaleAfter)
+        {
+            note = $"{note} · may be out of date";
+        }
+
+        return usage with
+        {
+            Name = "Claude",
+            Windows = windows,
+            Note = note
+        };
+    }
+
+    private static string FormatAge(TimeSpan age) => age switch
+    {
+        { TotalMinutes: < 1 } => "<1 min",
+        { TotalMinutes: < 60 } => $"{(int)age.TotalMinutes} min",
+        { TotalHours: < 24 } => $"{(int)age.TotalHours} h",
+        _ => $"{(int)age.TotalDays} d"
+    };
 
     private static async Task<ProviderUsage> ReadClaudeDirectAsync(CancellationToken cancellationToken)
     {
@@ -88,11 +329,12 @@ internal sealed class UsageService
         var credentialPath = Path.Combine(configDirectory, ".credentials.json");
         if (!File.Exists(credentialPath))
         {
-            throw new InvalidOperationException(
-                "No Claude session was found. Run 'claude auth login' once; the terminal does not need to remain open.");
+            throw new ClaudeAuthException(
+                "No Claude session was found. Sign in to Claude Code once; the terminal does not need to remain open.");
         }
 
         string? accessToken;
+        DateTimeOffset? expiresAt = null;
         await using (var stream = new FileStream(
             credentialPath,
             FileMode.Open,
@@ -110,7 +352,7 @@ internal sealed class UsageService
                  !root.TryGetProperty("oauth", out oauth)) ||
                 oauth.ValueKind != JsonValueKind.Object)
             {
-                throw new InvalidOperationException("No Claude OAuth session was found.");
+                throw new ClaudeAuthException("No Claude OAuth session was found.");
             }
 
             accessToken = oauth.TryGetProperty("accessToken", out var tokenElement)
@@ -118,12 +360,21 @@ internal sealed class UsageService
                 : oauth.TryGetProperty("access_token", out tokenElement)
                     ? tokenElement.GetString()
                     : null;
+            expiresAt = ReadExpiry(oauth);
         }
 
         if (string.IsNullOrWhiteSpace(accessToken))
         {
-            throw new InvalidOperationException(
-                "The Claude OAuth session is empty. Run 'claude auth login' once.");
+            throw new ClaudeAuthException(
+                "The Claude OAuth session is empty. Sign in to Claude Code once.");
+        }
+
+        if (expiresAt is { } expiry && expiry <= DateTimeOffset.Now.AddSeconds(30))
+        {
+            // Claude Code renews this token itself; calling now would only burn
+            // a request and come back HTTP 401.
+            throw new ClaudeAuthException(
+                $"The Claude session expired at {expiry.ToLocalTime():HH:mm}. Open Claude Code once to renew it.");
         }
 
         using var request = new HttpRequestMessage(
@@ -131,7 +382,7 @@ internal sealed class UsageService
             "https://api.anthropic.com/api/oauth/usage");
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
         request.Headers.TryAddWithoutValidation("anthropic-beta", "oauth-2025-04-20");
-        request.Headers.UserAgent.ParseAdd("WindowsAIStatusbar/3.0.0");
+        request.Headers.UserAgent.ParseAdd("WindowsAIStatusbar/3.0.1");
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
         using var response = await ClaudeHttpClient.SendAsync(
@@ -141,7 +392,9 @@ internal sealed class UsageService
         if (!response.IsSuccessStatusCode)
         {
             throw new HttpRequestException(
-                $"Claude usage service returned HTTP {(int)response.StatusCode}.");
+                $"Claude usage service returned HTTP {(int)response.StatusCode}.",
+                null,
+                response.StatusCode);
         }
 
         await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
@@ -157,8 +410,28 @@ internal sealed class UsageService
                 "Claude",
                 windows,
                 DateTimeOffset.Now,
-                Note: "Live · Anthropic account")
+                Note: $"Live · Anthropic account · read {DateTimeOffset.Now:HH:mm}")
             : throw new JsonException("No limit window was found in the Claude response.");
+    }
+
+    private static DateTimeOffset? ReadExpiry(JsonElement oauth)
+    {
+        if (!oauth.TryGetProperty("expiresAt", out var element) &&
+            !oauth.TryGetProperty("expires_at", out element))
+        {
+            return null;
+        }
+
+        var milliseconds = element.ValueKind switch
+        {
+            JsonValueKind.Number when element.TryGetInt64(out var number) => number,
+            JsonValueKind.String when long.TryParse(element.GetString(), out var parsed) => parsed,
+            _ => 0L
+        };
+
+        return milliseconds > 0
+            ? DateTimeOffset.FromUnixTimeMilliseconds(milliseconds)
+            : null;
     }
 
     private static void AddClaudeDirectWindow(
@@ -170,6 +443,7 @@ internal sealed class UsageService
         if (!root.TryGetProperty(propertyName, out var value) ||
             value.ValueKind != JsonValueKind.Object ||
             !value.TryGetProperty("utilization", out var usedElement) ||
+            usedElement.ValueKind != JsonValueKind.Number ||
             !usedElement.TryGetDouble(out var usedPercent))
         {
             return;
@@ -186,22 +460,23 @@ internal sealed class UsageService
         windows.Add(new LimitWindow(label, usedPercent, resetsAt));
     }
 
-    private async Task<ProviderUsage> ReadClaudeCacheAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Reads one of the on-disk snapshots. Returns <see langword="null"/> when
+    /// the file is missing, unreadable, or carries no usable window.
+    /// </summary>
+    private static async Task<ProviderUsage?> ReadClaudeCacheFileAsync(
+        string path,
+        CancellationToken cancellationToken)
     {
         try
         {
-            if (!File.Exists(_claudeCachePath))
+            if (!File.Exists(path))
             {
-                return new ProviderUsage(
-                    "Claude Code",
-                    [],
-                    null,
-                    "No data yet",
-                    "Open Claude Code and send one message; limits will arrive through the safe status-line bridge.");
+                return null;
             }
 
             await using var stream = new FileStream(
-                _claudeCachePath,
+                path,
                 FileMode.Open,
                 FileAccess.Read,
                 FileShare.ReadWrite,
@@ -213,6 +488,10 @@ internal sealed class UsageService
 
             AddClaudeWindow(root, "five_hour", "5-hour", windows);
             AddClaudeWindow(root, "seven_day", "Weekly", windows);
+            if (windows.Count == 0)
+            {
+                return null;
+            }
 
             DateTimeOffset? updatedAt = null;
             if (root.TryGetProperty("updated_at", out var updatedElement) &&
@@ -221,27 +500,47 @@ internal sealed class UsageService
                 updatedAt = DateTimeOffset.FromUnixTimeSeconds(updatedUnix);
             }
 
-            var note = updatedAt is not null && DateTimeOffset.Now - updatedAt > TimeSpan.FromHours(8)
-                ? "Claude data may be stale; it refreshes automatically while Claude Code is open."
-                : null;
-
-            return windows.Count > 0
-                ? new ProviderUsage("Claude Code", windows, updatedAt, Note: note)
-                : new ProviderUsage(
-                    "Claude Code",
-                    [],
-                    updatedAt,
-                    "The status line has not produced limit data yet",
-                    "It appears automatically after a message in Claude Code.");
+            return new ProviderUsage("Claude", windows, updatedAt);
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
         {
-            return new ProviderUsage(
-                "Claude Code",
-                [],
-                null,
-                "Could not read the Claude cache",
-                ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Mirrors a successful live reading to disk so a restart starts from real
+    /// data instead of whatever the status-line bridge last wrote.
+    /// </summary>
+    private async Task WriteClaudeLiveCacheAsync(ProviderUsage usage, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var payload = new Dictionary<string, object?>
+            {
+                ["updated_at"] = (usage.UpdatedAt ?? DateTimeOffset.Now).ToUnixTimeSeconds()
+            };
+
+            foreach (var window in usage.Windows)
+            {
+                var key = window.Label == "Weekly" ? "seven_day" : "five_hour";
+                payload[key] = new Dictionary<string, object?>
+                {
+                    ["used_percentage"] = window.UsedPercent,
+                    ["resets_at"] = window.ResetsAt?.ToUnixTimeSeconds()
+                };
+            }
+
+            var temporaryPath = _liveCachePath + ".tmp";
+            await File.WriteAllTextAsync(
+                temporaryPath,
+                JsonSerializer.Serialize(payload, JsonOptions),
+                cancellationToken);
+            File.Move(temporaryPath, _liveCachePath, overwrite: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // The cache is an optimisation; losing it is not worth surfacing.
         }
     }
 

@@ -115,7 +115,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
         openItem.Click += (_, _) => _detailsForm.ShowNearTray();
         exitItem.Click += (_, _) => ExitApplication();
-        _refreshItem.Click += async (_, _) => await RefreshAsync();
+        _refreshItem.Click += async (_, _) => await RefreshAsync(forceLive: true);
         _startupItem.Click += (_, _) => ToggleStartup();
         _largePanelItem.Click += (_, _) => SetLargePanelVisibility(_largePanelItem.Checked);
         _showClaudeItem.Click += (_, _) => SetProviderVisibility(true, _showClaudeItem.Checked);
@@ -124,7 +124,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _usedModeItem.Click += (_, _) => SetDisplayMode(BarDisplayMode.Used);
         _claudeNotifyIcon.MouseClick += ShowDetailsOnLeftClick;
         _codexNotifyIcon.MouseClick += ShowDetailsOnLeftClick;
-        _detailsForm.RefreshRequested += async (_, _) => await RefreshAsync();
+        _detailsForm.RefreshRequested += async (_, _) => await RefreshAsync(forceLive: true);
         _detailsForm.DisplayModeChanged += (_, mode) => SetDisplayMode(mode);
         _detailsForm.LargePanelVisibilityChanged += (_, visible) => SetLargePanelVisibility(visible);
         _detailsForm.ClaudeVisibilityChanged += (_, visible) => SetProviderVisibility(true, visible);
@@ -197,7 +197,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
-    private async Task RefreshAsync()
+    private async Task RefreshAsync(bool forceLive = false)
     {
         if (!await _refreshGate.WaitAsync(0))
         {
@@ -211,7 +211,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _refreshItem.Text = "Refreshing…";
 
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
-            _snapshot = await _usageService.GetSnapshotAsync(timeout.Token);
+            _snapshot = await _usageService.GetSnapshotAsync(timeout.Token, forceLive);
             UpdateUi();
         }
         finally

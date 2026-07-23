@@ -239,7 +239,8 @@ internal sealed class DetailsForm : Form
     {
         _claudeCard.Usage = snapshot.Claude;
         _codexCard.Usage = snapshot.Codex;
-        _updatedLabel.Text = $"Last checked  {snapshot.UpdatedAt:HH:mm:ss}  •  auto-refresh every 30s";
+        _updatedLabel.Text =
+            $"Last checked  {snapshot.UpdatedAt:HH:mm:ss}  •  every 30s  •  Claude live read every 5 min";
     }
 
     public void UpdateSettings(AppSettings settings)
