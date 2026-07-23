@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.0.1
+
+- Prevented desktop and taskbar focus transitions from being mistaken for
+  full-screen applications.
+- Removed the brief hide/show flicker when clicking the Windows desktop.
+
 ## 3.0.0
 
 - Renamed the application and executable to Windows AI Statusbar.

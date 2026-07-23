@@ -363,6 +363,15 @@ internal sealed class TaskbarDockForm : Form
             return false;
         }
 
+        // Explorer's desktop surfaces deliberately cover the whole monitor.
+        // They are not full-screen applications and must not hide the panel
+        // when the user clicks the desktop or moves focus through the taskbar.
+        var className = GetWindowClassName(foreground);
+        if (className is "Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd")
+        {
+            return false;
+        }
+
         if (!GetWindowRect(foreground, out var foregroundRect))
         {
             return false;
@@ -389,6 +398,14 @@ internal sealed class TaskbarDockForm : Form
             foregroundRect.Top <= monitorInfo.Monitor.Top + tolerance &&
             foregroundRect.Right >= monitorInfo.Monitor.Right - tolerance &&
             foregroundRect.Bottom >= monitorInfo.Monitor.Bottom - tolerance;
+    }
+
+    private static string GetWindowClassName(IntPtr window)
+    {
+        var className = new System.Text.StringBuilder(256);
+        return GetClassName(window, className, className.Capacity) > 0
+            ? className.ToString()
+            : string.Empty;
     }
 
     private void RenderLayeredWindow()
@@ -691,6 +708,12 @@ internal sealed class TaskbarDockForm : Form
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(
+        IntPtr handle,
+        System.Text.StringBuilder className,
+        int maximumCount);
 
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromWindow(IntPtr handle, uint flags);
