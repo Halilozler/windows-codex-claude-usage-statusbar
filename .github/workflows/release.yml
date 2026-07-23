@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Publish
+        run: >
+          dotnet publish .\WindowsAIStatusbar.csproj
+          -c Release
+          -r win-x64
+          --self-contained false
+          -p:PublishSingleFile=true
+          -o .\publish
+      - name: Build release notes
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $hash = (Get-FileHash .\publish\WindowsAIStatusbar.exe -Algorithm SHA256).Hash
+          "$hash  WindowsAIStatusbar.exe" |
+            Out-File .\publish\SHA256.txt -Encoding ascii
+
+          # Lift this version's section out of the changelog.
+          $lines = Get-Content .\CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^## $([regex]::Escape($version))$").LineNumber
+          if (-not $start) { throw "CHANGELOG.md has no '## $version' section." }
+          $rest = $lines[$start..($lines.Count - 1)]
+          $end = ($rest | Select-String -Pattern '^## ' | Select-Object -First 1).LineNumber
+          $body = if ($end) { $rest[0..($end - 2)] } else { $rest }
+
+          @(
+            $body
+            ''
+            '## Verify the download'
+            ''
+            'The executable is not code-signed. Confirm it matches this build:'
+            ''
+            '```powershell'
+            'Get-FileHash .\WindowsAIStatusbar.exe -Algorithm SHA256'
+            '```'
+            ''
+            "``$hash``"
+            ''
+            'Built by GitHub Actions from this tag, so the hash covers the'
+            'artifact published here.'
+          ) | Out-File .\notes.md -Encoding utf8
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            .\publish\WindowsAIStatusbar.exe `
+            .\publish\SHA256.txt `
+            .\install.ps1 `
+            .\uninstall.ps1 `
+            --title "Windows AI Statusbar $env:GITHUB_REF_NAME" `
+            --notes-file .\notes.md
