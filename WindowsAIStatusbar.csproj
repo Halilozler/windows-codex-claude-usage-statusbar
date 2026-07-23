@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>WindowsAIStatusbar</AssemblyName>
+    <RootNamespace>ClaudeCodexLimits</RootNamespace>
+    <Version>3.0.0</Version>
+    <Authors>Windows AI Statusbar contributors</Authors>
+    <Description>Compact Windows taskbar monitor for Claude and Codex usage limits.</Description>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+    <PublishTrimmed>false</PublishTrimmed>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\claude-seeklogo.png" />
+    <EmbeddedResource Include="Assets\openai-codex-seeklogo.png" />
+  </ItemGroup>
+</Project>
